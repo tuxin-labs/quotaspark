@@ -7,6 +7,19 @@
 （内容为 `"hi"`），把窗口"点火"到你想要的时间点——例如 05:30 / 10:30 / 15:30 三连发，
 窗口就会首尾相接、全天可用。
 
+[![Release](https://img.shields.io/github/v/release/tuxin-labs/quotaspark)](https://github.com/tuxin-labs/quotaspark/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-blue)
+![Built with Tauri 2](https://img.shields.io/badge/built%20with-Tauri%202-orange)
+
+![界面预览](docs/screenshot-dark.png)
+
+## 下载安装
+
+从 [Releases](https://github.com/tuxin-labs/quotaspark/releases/latest) 下载
+`QuotaSpark_x.y.z_x64-setup.exe` 双击安装（Windows 10+）。已安装的用户可在
+「设置」里一键检查并安装新版本。
+
 ## 功能
 
 - **同步 cc-switch 配置**：一键读取 `~/.cc-switch/cc-switch.db`（只读），导入全部
