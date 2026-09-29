@@ -33,3 +33,4 @@ e2e-artifacts
 # 更新器签名私钥 —— 绝不能提交
 *.key
 src-tauri/keys/
+latest.json
