@@ -64,7 +64,7 @@ npm run tauri build   # 打包安装程序
      npm run tauri build
      ```
    - 产物在 `src-tauri/target/release/bundle/`，安装包旁会有同名 `.sig` 签名文件
-3. **发布到 GitHub**：在 Releases 上传安装包（建议先 zip 一层）+ `.sig`，并上传一份
+3. **发布到 GitHub**：在 Releases 上传安装包（直接上传安装包即可）+ `.sig`，并上传一份
    `latest.json`（格式如下），用户端「设置 → 检查更新」即可自动发现并一键安装：
    ```json
    {
@@ -74,13 +74,13 @@ npm run tauri build   # 打包安装程序
      "platforms": {
        "windows-x86_64": {
          "signature": "（.sig 文件的内容）",
-         "url": "https://github.com/<你的用户名>/quotaspark/releases/download/v0.2.0/QuotaSpark_0.2.0_x64-setup.zip"
+         "url": "https://github.com/tuxin-labs/quotaspark/releases/download/v0.1.0/QuotaSpark_0.1.0_x64-setup.exe"
        }
      }
    }
    ```
 4. **更新源**：`tauri.conf.json → plugins.updater.endpoints` 目前是占位地址
-   （`YOUR_GITHUB_USERNAME`），发布前替换成你自己的
+   （`tuxin-labs`），发布前替换成你自己的
    `https://github.com/<用户名>/quotaspark/releases/latest/download/latest.json`
 
 ## 测试
