@@ -17,6 +17,8 @@ mkdirSync(SHOT_DIR, { recursive: true });
 const TEST_NAME = "测试-勿动E2E";
 const testCard = page => page.locator(`[data-testid="provider-card"][data-name="${TEST_NAME}"]`);
 const zhipuCard = page => page.locator('[data-testid="provider-card"][data-name="智谱"]');
+// chips 定位必须限定在测试卡内——其它卡片（如用户自己的智谱）也有各自的定时 chips
+const testChips = page => testCard(page).locator('[data-testid="time-chips"] .chip');
 
 const results = [];
 let page;
@@ -174,13 +176,13 @@ await step("【调度】模板菜单只有「全天接力」一项，套用 → 
   const items = await page.getByTestId("tpl-menu").getByRole("button").count();
   if (items !== 1) throw new Error(`模板应为 1 项，实际 ${items}`);
   await page.getByTestId("tpl-menu").getByRole("button", { name: /全天接力/ }).click();
-  await page.locator('[data-testid="time-chips"] .chip').first().waitFor({ timeout: 5000 });
+  await testChips(page).first().waitFor({ timeout: 5000 });
   await pollUntil(
     async () => {
-      const chips = await page.locator('[data-testid="time-chips"] .chip').count();
+      const chips = await testChips(page).count();
       return { ok: chips === 4, value: chips };
     },
-    "期望 4 个 chips",
+    "期望测试卡上有 4 个 chips",
   );
   await testCard(page).locator(".badge.on").waitFor({ timeout: 3000 });
   await page.screenshot({ path: `${SHOT_DIR}/04-template-applied.png` });
@@ -192,7 +194,7 @@ await step("【调度】新增时间 01:30 → 5 个 chips", async () => {
   await page.getByTestId("time-input").press("Enter");
   await pollUntil(
     async () => {
-      const n = await page.locator('[data-testid="time-chips"] .chip').count();
+      const n = await testChips(page).count();
       return { ok: n === 5, value: n };
     },
     "chips 数不为 5",
@@ -213,8 +215,8 @@ async function pollUntil(fn, desc, timeoutMs = 3000) {
 
 await step("【调度】修改 01:30 → 06:00（键盘真实键入，改后排序正确）", async () => {
   // chips 排序显示，01:30 排在第一位；定位要按内容而非位置
-  await page
-    .locator('[data-testid="time-chips"] .chip', { hasText: "01:30" })
+  await testChips(page)
+    .filter({ hasText: "01:30" })
     .first()
     .locator(".chip-time")
     .click();
@@ -223,7 +225,7 @@ await step("【调度】修改 01:30 → 06:00（键盘真实键入，改后排�
   await input.press("Enter");
   await pollUntil(
     async () => {
-      const chips = await page.locator('[data-testid="time-chips"] .chip').allInnerTexts();
+      const chips = await testChips(page).allInnerTexts();
       const want = ["05:30", "06:00", "10:30", "15:30", "20:30"];
       const got = chips.map(t => t.replace(/\n×$/, "").trim());
       return { ok: JSON.stringify(got) === JSON.stringify(want), value: got };
@@ -233,14 +235,14 @@ await step("【调度】修改 01:30 → 06:00（键盘真实键入，改后排�
 });
 
 await step("【调度】删除 06:00 chip → 回到 4 个", async () => {
-  await page
-    .locator('[data-testid="time-chips"] .chip', { hasText: "06:00" })
+  await testChips(page)
+    .filter({ hasText: "06:00" })
     .first()
     .locator(".chip-x")
     .click();
   await pollUntil(
     async () => {
-      const n = await page.locator('[data-testid="time-chips"] .chip').count();
+      const n = await testChips(page).count();
       return { ok: n === 4, value: n };
     },
     "chips 数不为 4",
@@ -323,19 +325,32 @@ await step("【额度刷新】↻ 刷新按钮可用且查询时间更新", asyn
 
 /* ── 5. 设置 ─────────────────────────────────────────────── */
 
-await step("【设置】开机自启开 → 关（恢复原状）", async () => {
-  await page.getByTestId("settings-btn").click();
-  await page.getByTestId("settings-dialog").waitFor({ timeout: 3000 });
-  const tg = page.getByTestId("autostart-toggle");
-  const before = await tg.isChecked();
-  await tg.click();
-  await page.waitForTimeout(400);
-  if ((await tg.isChecked()) === before) throw new Error("开关状态未变化");
-  await tg.click();
-  await page.waitForTimeout(400);
-  if ((await tg.isChecked()) !== before) throw new Error("未能恢复原状");
-  await page.screenshot({ path: `${SHOT_DIR}/07-settings.png` });
-  await page.getByRole("button", { name: "关闭" }).click();
+await step("【自启】顶栏开关 → 状态往返（恢复原状）", async () => {
+  const btn = page.getByTestId("autostart-btn");
+  const before = (await btn.innerText()).includes("✓");
+  await btn.click();
+  await pollUntil(
+    async () => ({ ok: (await btn.innerText()).includes("✓") !== before, value: "toggled" }),
+    "自启状态未变化",
+  );
+  await btn.click();
+  await pollUntil(
+    async () => ({ ok: (await btn.innerText()).includes("✓") === before, value: "restored" }),
+    "自启状态未恢复",
+  );
+});
+
+await step("【检查更新】顶栏按钮 → 有反馈（未配置更新源时报错属预期）", async () => {
+  await page.getByTestId("check-update-btn").click();
+  await pollUntil(
+    async () => {
+      const t = await page.getByTestId("notice").innerText();
+      return { ok: /已是最新|检查更新失败|发现新版本/.test(t), value: t.slice(0, 60) };
+    },
+    "检查更新没有产生反馈",
+    10000,
+  );
+  await page.screenshot({ path: `${SHOT_DIR}/07-update-check.png` });
 });
 
 /* ── 6. 删除 ─────────────────────────────────────────────── */

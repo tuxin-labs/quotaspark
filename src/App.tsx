@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type LogEntry, type ProviderCard, type ProviderConfig, type SyncReport, type QuotaTier } from "./api";
 import ProviderForm from "./ProviderForm";
-import UpdaterSection from "./UpdaterSection";
+import UpdateButton from "./UpdateButton";
 import "./App.css";
 
 function fmtTime(ts: number) {
@@ -69,13 +69,6 @@ const AutoIcon = () => (
   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
     <circle cx="12" cy="12" r="9" />
     <path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
-  </svg>
-);
-
-const GearIcon = () => (
-  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <circle cx="12" cy="12" r="3" />
-    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
   </svg>
 );
 
@@ -293,7 +286,6 @@ export default function App() {
   const [editing, setEditing] = useState<ProviderConfig | null | undefined>(undefined);
   const [notice, setNotice] = useState("");
   const [confirmDel, setConfirmDel] = useState<ProviderCard | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
   const [autostart, setAutostart] = useState(false);
   const [querying, setQuerying] = useState<Record<string, boolean>>({});
   const [themeMode, cycleTheme] = useThemeCycle();
@@ -310,6 +302,7 @@ export default function App() {
 
   useEffect(() => {
     refresh();
+    api.getAutostart().then(setAutostart).catch(() => {});
     const un = api.onChanged(() => {
       refresh();
     });
@@ -357,20 +350,12 @@ export default function App() {
     showNotice("已开始激活全部供应商，结果见日志");
   };
 
-  const openSettings = async () => {
-    try {
-      setAutostart(await api.getAutostart());
-    } catch {
-      setAutostart(false);
-    }
-    setShowSettings(true);
-  };
-
   const toggleAutostart = async () => {
     const next = !autostart;
     try {
       await api.setAutostart(next);
       setAutostart(next);
+      showNotice(next ? "已开启开机自启：登录后自动后台运行" : "已关闭开机自启");
     } catch (e) {
       showNotice(`设置开机自启失败：${e}`);
     }
@@ -395,9 +380,15 @@ export default function App() {
           >
             {themeMode === "auto" ? <AutoIcon /> : themeMode === "dark" ? <MoonIcon /> : <SunIcon />}
           </button>
-          <button className="icon-btn" title="设置" data-testid="settings-btn" onClick={openSettings}>
-            <GearIcon />
+          <button
+            className={autostart ? "toggle-on" : ""}
+            title={autostart ? "开机自启：已开启（点击关闭）" : "开机自启：已关闭（点击开启）"}
+            data-testid="autostart-btn"
+            onClick={toggleAutostart}
+          >
+            {autostart ? "开机自启 ✓" : "开机自启"}
           </button>
+          <UpdateButton onNotice={showNotice} />
           <button onClick={onSync} data-testid="sync-btn">同步 cc-switch 配置</button>
           <button onClick={() => setEditing(null)} data-testid="add-btn">＋ 手动添加</button>
           <button className="primary" onClick={onActivateAll} data-testid="activate-all-btn">全部激活</button>
@@ -530,32 +521,6 @@ export default function App() {
               >
                 删除
               </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 设置 */}
-      {showSettings && (
-        <div className="modal-mask" onClick={() => setShowSettings(false)}>
-          <div className="modal settings" onClick={(e) => e.stopPropagation()} data-testid="settings-dialog">
-            <h3>设置</h3>
-            <label className="check row-check">
-              <input
-                type="checkbox"
-                checked={autostart}
-                data-testid="autostart-toggle"
-                onChange={toggleAutostart}
-              />
-              开机自动启动
-            </label>
-            <p className="hint">
-              开启后，Windows 登录时自动在后台启动（带托盘），定时调度即刻生效。设置写入系统注册表
-              HKCU\Software\Microsoft\Windows\CurrentVersion\Run。
-            </p>
-            <UpdaterSection />
-            <div className="form-actions">
-              <button onClick={() => setShowSettings(false)}>关闭</button>
             </div>
           </div>
         </div>

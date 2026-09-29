@@ -603,16 +603,6 @@ button.danger {
   margin: 0 0 18px;
 }
 
-.row-check {
-  flex-direction: row !important;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-}
-
-.row-check input {
-  accent-color: var(--accent);
-}
 
 .card-foot {
   display: flex;
@@ -942,36 +932,16 @@ button.danger {
   color: var(--text);
 }
 
-/* ── 设置弹窗：检查更新 ──────────────────────── */
 
-.updater {
-  border-top: 1px dashed var(--border);
-  margin-top: 6px;
-  padding-top: 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+/* ── 顶栏：开机自启开关 ────────────────────── */
+
+.toggle-on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
-.updater-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 10px;
-}
-
-.updater-ver {
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.updater-msg {
-  font-size: 12.5px;
-  line-height: 1.6;
-  margin: 0;
-  word-break: break-all;
-}
-
-.updater-msg.err {
-  color: var(--fail);
+.toggle-on:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
