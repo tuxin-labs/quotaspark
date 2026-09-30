@@ -1,0 +1,70 @@
+name: Bug 报告
+description: 报告应用功能异常
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！提交前请先搜索 [已有 Issue](https://github.com/tuxin-labs/quotaspark/issues?q=is%3Aissue) 避免重复。
+        **注意：日志片段里如包含 API Key 请先抹除。**
+  - type: dropdown
+    id: area
+    attributes:
+      label: 出问题的功能
+      options:
+        - 定时激活（没触发/触发失败）
+        - 激活请求报错
+        - 额度/余额查询
+        - cc-switch 同步
+        - 开机自启 / 托盘
+        - 界面显示
+        - 更新功能
+        - 其他
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本
+      description: 顶栏「检查更新」旁的当前版本号，或安装包文件名里的版本
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows 版本
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 怎么操作会出现问题
+      placeholder: |
+        1. 打开 …
+        2. 点击 …
+        3. 出现 …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望与实际
+      description: 你期望发生什么，实际发生了什么
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: "`~/.cc-activator/logs/activator.log` 中的相关片段（抹掉 API Key）"
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 自检
+      options:
+        - label: 我已搜索过已有 Issue
+        - label: 日志中不含 API Key 等敏感信息

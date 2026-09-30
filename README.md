@@ -86,6 +86,12 @@ npm run tauri build   # 打包安装程序
 
 打版与签名发布流程见 [docs/RELEASING.md](docs/RELEASING.md)。
 
+## 贡献
+
+欢迎 Issue 反馈问题和建议（请用 Issue 模板），PR 请先阅读
+[CONTRIBUTING.md](CONTRIBUTING.md) 中的环境搭建与规范。参与讨论请遵守
+[行为准则](CODE_OF_CONDUCT.md)。
+
 ## 致谢
 
 - [cc-switch](https://github.com/farion1231/cc-switch)（MIT）—— 额度查询的端点与解析逻辑移植自该项目
