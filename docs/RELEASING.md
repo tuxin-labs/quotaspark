@@ -50,7 +50,12 @@ git add -A && git commit -m "release: v0.2.0" && git push
 ## 5. GitHub Release
 
 仓库页 → Releases → Draft a new release → 新建 tag `v0.2.0` → 上传三件套
-（安装包 + `.sig` + `latest.json`）→ Release label 选 **None** → Publish。
+（安装包 + `.sig` + `latest.json`，附件本身的 label 留空）→
+**Release label 选 Latest** → Publish。
+
+注意：新 UI 的 Release label 是发布级选项（None / Pre-release / Latest），
+必须选 Latest——更新器端点是 `releases/latest/download/latest.json`，
+选 None 会让所有用户收不到新版本。
 
 用户端：启动时自动检查（有新版顶栏按钮变「下载并安装」并提示），或手动点
 「检查更新」→ 下载安装 → 重启生效。
