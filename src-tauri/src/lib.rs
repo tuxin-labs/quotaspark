@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use store::Config;
 use tauri::Manager;
+use tauri_plugin_autostart::ManagerExt;
 
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem};
@@ -71,7 +72,8 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            // 注册自启时附带 --minimized：开机拉起后静默进托盘，不弹主窗口
+            Some(vec!["--minimized"]),
         ))
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
@@ -89,6 +91,52 @@ pub fn run() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // 开机自启默认开启：标记缺失（旧配置/全新安装）时补开并写标记，
+            // 之后以顶栏开关为准，用户手动关闭不会再被拉起。enable 失败不写
+            // 标记，下次启动重试。
+            {
+                let state = handle.state::<AppState>();
+                let mut st = state.0.lock().unwrap();
+                if st.config.autostart_defaulted.is_none() {
+                    match handle.autolaunch().enable() {
+                        Ok(()) => {
+                            st.config.autostart_defaulted = Some(true);
+                            if let Err(e) = st.config.save(&st.config_path) {
+                                eprintln!("写入开机自启默认标记失败: {e}");
+                            }
+                            store::append_log_file(&store::LogEntry {
+                                ts: chrono::Utc::now().timestamp_millis(),
+                                provider_id: String::new(),
+                                provider_name: String::new(),
+                                kind: "schedule".into(),
+                                ok: true,
+                                detail: "已默认开启开机自启，重启后将自动后台运行".into(),
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("默认开启开机自启失败，下次启动重试: {e}");
+                            store::append_log_file(&store::LogEntry {
+                                ts: chrono::Utc::now().timestamp_millis(),
+                                provider_id: String::new(),
+                                provider_name: String::new(),
+                                kind: "schedule".into(),
+                                ok: false,
+                                detail: format!("默认开启开机自启失败: {e}"),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // 窗口默认隐藏（tauri.conf.json visible:false），手动打开（无
+            // --minimized 参数）时显示；开机自启拉起则保持静默进托盘
+            if !std::env::args().any(|a| a == "--minimized") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
 
             // 启动定时调度（每 30 秒检查一次触发时间）
             {
