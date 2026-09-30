@@ -1,0 +1,27 @@
+name: 功能建议
+description: 提议新功能或改进
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提议前请先搜索 [已有 Issue](https://github.com/tuxin-labs/quotaspark/issues?q=is%3Aissue)。
+        较大的功能建议先描述使用场景，方案细节可以在讨论中完善。
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景
+      description: 你想解决什么问题？现在是怎么做的、哪里不顺？
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 你期望的效果，有想法的话可以带上实现思路
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 自检
+      options:
+        - label: 我已搜索过已有 Issue
