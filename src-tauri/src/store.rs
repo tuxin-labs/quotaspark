@@ -61,6 +61,10 @@ pub struct Config {
     /// 供应商 id -> 最近一次定时触发的去重键 "id|日期|HH:MM"
     #[serde(default)]
     pub last_fired: HashMap<String, String>,
+    /// 供应商 id -> 最近一次成功激活的时刻（毫秒时间戳）。
+    /// 定时激活据此判断上一窗口（+5h）是否仍未过期，见 scheduler::scheduled_delay_ms
+    #[serde(default)]
+    pub last_activated: HashMap<String, i64>,
     /// 开机自启默认开启的一次性标记。缺失 = 尚未引导（旧配置/全新安装），
     /// 启动时会自动补开自启并写标记；标记存在后即以顶栏开关的注册状态为准。
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -241,7 +241,11 @@ pub fn save_provider(
 }
 
 #[tauri::command]
-pub fn delete_provider(app: AppHandle, state: tauri::State<AppState>, id: String) -> Result<(), String> {
+pub fn delete_provider(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    id: String,
+) -> Result<(), String> {
     let shared = state.0.clone();
     let (name, detail) = {
         let mut st = shared.lock().unwrap();
@@ -255,6 +259,7 @@ pub fn delete_provider(app: AppHandle, state: tauri::State<AppState>, id: String
         st.config.providers.retain(|p| p.id != id);
         st.quota.remove(&id);
         st.config.last_fired.remove(&id);
+        st.config.last_activated.remove(&id);
         st.config.save(&st.config_path)?;
         let detail = format!("已删除供应商「{name}」（下次同步会按 cc-switch 现状重新导入）");
         (name, detail)
@@ -336,7 +341,7 @@ pub async fn activate_now(
                     .cloned()
                     .ok_or_else(|| "供应商不存在".to_string())?
             };
-            spawn_activation(app, shared, p);
+            spawn_activation(app, shared, p, false, 0);
             Ok(1)
         }
         None => {
@@ -354,17 +359,49 @@ pub fn activate_all_spawn(app: AppHandle, shared: Arc<Mutex<Inner>>) {
         st.config.providers.clone()
     };
     for p in providers {
-        spawn_activation(app.clone(), shared.clone(), p);
+        spawn_activation(app.clone(), shared.clone(), p, false, 0);
     }
 }
 
-pub fn spawn_activation(app: AppHandle, shared: Arc<Mutex<Inner>>, p: ProviderConfig) {
+/// 发起一次激活。scheduled=true 为定时触发（激活后核对窗口是否真的点亮）；
+/// delay_ms > 0 表示上一窗口未过期：先记录推迟日志，等窗口过期后再发
+/// （推迟量由 scheduler::scheduled_delay_ms 算出）。手动激活传 false / 0。
+pub fn spawn_activation(
+    app: AppHandle,
+    shared: Arc<Mutex<Inner>>,
+    p: ProviderConfig,
+    scheduled: bool,
+    delay_ms: i64,
+) {
     tauri::async_runtime::spawn(async move {
+        if delay_ms > 0 {
+            let secs = (delay_ms / 1000).max(1);
+            log_and_emit(
+                &app,
+                &shared,
+                LogEntry {
+                    ts: now_ms(),
+                    provider_id: p.id.clone(),
+                    provider_name: p.name.clone(),
+                    kind: "activate".into(),
+                    ok: true,
+                    detail: format!("上一激活窗口尚未过期，推迟 {secs} 秒再发，避免被旧窗口吞掉"),
+                },
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms as u64)).await;
+        }
         let result = engine::activate(&p).await;
         let (ok, detail) = match result {
             Ok(d) => (true, d),
             Err(e) => (false, e),
         };
+        // 记录成功激活时刻，供下一次定时触发判断上一窗口是否已过期
+        let activated_at = now_ms();
+        if ok {
+            let mut st = shared.lock().unwrap();
+            st.config.last_activated.insert(p.id.clone(), activated_at);
+            let _ = st.config.save(&st.config_path);
+        }
         log_and_emit(
             &app,
             &shared,
@@ -377,9 +414,28 @@ pub fn spawn_activation(app: AppHandle, shared: Arc<Mutex<Inner>>, p: ProviderCo
                 detail: detail.clone(),
             },
         );
-        // 激活成功后顺手刷新额度（如果该供应商支持）
+        // 激活成功后顺手刷新额度（如果该供应商支持），并核对窗口是否真的点亮
         if ok && quota::detect_kind(&p.base_url).is_some() {
-            fetch_and_store_quota(app, shared, p).await;
+            let q = fetch_and_store_quota(app.clone(), shared.clone(), p.clone()).await;
+            let expected_reset = if scheduled {
+                Some(activated_at + engine::WINDOW_MS)
+            } else {
+                None
+            };
+            if let Some((confirm_ok, confirm_detail)) = window_confirm(&q, expected_reset) {
+                log_and_emit(
+                    &app,
+                    &shared,
+                    LogEntry {
+                        ts: now_ms(),
+                        provider_id: p.id.clone(),
+                        provider_name: p.name.clone(),
+                        kind: "activate".into(),
+                        ok: confirm_ok,
+                        detail: confirm_detail,
+                    },
+                );
+            }
         }
     });
 }
@@ -404,7 +460,12 @@ pub async fn query_quota(
 }
 
 /// 查询额度并写入状态 + 日志，完成后发事件让前端刷新。
-pub async fn fetch_and_store_quota(app: AppHandle, shared: Arc<Mutex<Inner>>, p: ProviderConfig) {
+/// 返回查询结果，供激活后的窗口确认使用。
+pub async fn fetch_and_store_quota(
+    app: AppHandle,
+    shared: Arc<Mutex<Inner>>,
+    p: ProviderConfig,
+) -> quota::QuotaResult {
     let q = quota::query_quota(&p).await;
     {
         let mut st = shared.lock().unwrap();
@@ -449,4 +510,120 @@ pub async fn fetch_and_store_quota(app: AppHandle, shared: Arc<Mutex<Inner>>, p:
             detail,
         },
     );
+    q
+}
+
+/// 窗口确认容差：覆盖 tick 抖动（数分钟内）、本机与供应商的时钟偏差、
+/// 展示时间的分钟取整。
+const CONFIRM_TOLERANCE_MS: i64 = 45 * 60 * 1000;
+
+/// 激活成功后核对刚刷新的额度回包，确认五小时窗口是否真的点亮。
+/// - 额度查询失败，或该供应商没有五小时窗口档位（按量余额类）→ None，不另记日志
+/// - 有档位但无重置时间（如智谱 "0% 且无重置时间"）→ 未点亮
+/// - 定时触发（expected_reset_ms = 本次激活 + 5h）：重置时间与预期偏差超过
+///   容差 → 判定请求被仍在活动的旧窗口吸收，本次没有点燃新窗口
+/// - 手动激活不比对预期，只要窗口点亮即视为成功
+fn window_confirm(
+    q: &quota::QuotaResult,
+    expected_reset_ms: Option<i64>,
+) -> Option<(bool, String)> {
+    if !q.ok {
+        return None;
+    }
+    let five = q.tiers.iter().find(|t| t.name == "五小时窗口")?;
+    let Some(reset) = &five.resets_at else {
+        return Some((
+            false,
+            "请求成功但五小时窗口未点亮（额度接口未返回活动窗口；若刚激活可能是统计延迟，可稍后刷新复核）"
+                .into(),
+        ));
+    };
+    let Some(expected) = expected_reset_ms else {
+        return Some((true, format!("窗口点亮中（{reset} 重置）")));
+    };
+    let drift_ok = five
+        .resets_at_ts
+        .map(|ts| (ts * 1000 - expected).abs() <= CONFIRM_TOLERANCE_MS)
+        .unwrap_or(false);
+    if drift_ok {
+        return Some((true, format!("已确认窗口点亮（{reset} 重置）")));
+    }
+    let exp_display = chrono::DateTime::from_timestamp_millis(expected)
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default();
+    Some((
+        false,
+        format!(
+            "激活请求疑似被仍在活动的旧窗口吸收：当前窗口 {reset} 重置，并非本次点燃（预期约 {exp_display} 重置）。若为接口统计延迟可稍后刷新复核"
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::WINDOW_MS;
+
+    fn five_tier(resets_at: Option<&str>, ts: Option<i64>) -> quota::QuotaTier {
+        quota::QuotaTier {
+            name: "五小时窗口".into(),
+            utilization: 1.0,
+            resets_at: resets_at.map(str::to_string),
+            resets_at_ts: ts,
+            amount: None,
+        }
+    }
+
+    fn q_ok(tiers: Vec<quota::QuotaTier>) -> quota::QuotaResult {
+        quota::QuotaResult {
+            ok: true,
+            plan: None,
+            tiers,
+            balance_text: None,
+            error: None,
+            ts: 0,
+        }
+    }
+
+    #[test]
+    fn test_window_confirm() {
+        let now = 1_800_000_000_000i64;
+        let expected = now + WINDOW_MS;
+        // 点亮且重置时间与预期吻合（差 1 分钟）→ 已确认
+        let q = q_ok(vec![five_tier(
+            Some("09-30 15:31"),
+            Some((expected - 60_000) / 1000),
+        )]);
+        let (ok, detail) = window_confirm(&q, Some(expected)).unwrap();
+        assert!(ok);
+        assert!(detail.contains("已确认窗口点亮"));
+        // 重置时间偏差 2 小时 → 判定被旧窗口吸收
+        let q = q_ok(vec![five_tier(
+            Some("09-30 13:31"),
+            Some((expected - 7_200_000) / 1000),
+        )]);
+        let (ok, detail) = window_confirm(&q, Some(expected)).unwrap();
+        assert!(!ok);
+        assert!(detail.contains("吸收"));
+        // 无重置时间 → 未点亮
+        let (ok, detail) =
+            window_confirm(&q_ok(vec![five_tier(None, None)]), Some(expected)).unwrap();
+        assert!(!ok);
+        assert!(detail.contains("未点亮"));
+        // 手动激活：不比对预期，只要点亮即绿
+        let q = q_ok(vec![five_tier(
+            Some("09-30 13:31"),
+            Some((expected - 7_200_000) / 1000),
+        )]);
+        let (ok, detail) = window_confirm(&q, None).unwrap();
+        assert!(ok);
+        assert!(detail.contains("窗口点亮中"));
+        // 按量余额类（没有五小时窗口档位）与查询失败 → 不做确认
+        assert!(window_confirm(&q_ok(vec![]), Some(expected)).is_none());
+        assert!(window_confirm(&quota::QuotaResult::default(), Some(expected)).is_none());
+    }
 }

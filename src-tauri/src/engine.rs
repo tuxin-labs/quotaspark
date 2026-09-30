@@ -1,9 +1,14 @@
-//! 激活引擎：直接向供应商 API 发送最小请求（max_tokens=1 的 "hi"），
-//! 请求成功即开始计算五小时窗口。额度查询在 quota.rs。
+//! 激活引擎：直接向供应商 API 发送最小请求（max_tokens=1 的 "hi"）。
+//! 注意：只有上一窗口已过期时，请求才会点燃新的五小时窗口；窗口内的请求
+//! 只会被算进旧窗口（HTTP 200 但不点亮新窗口），定时触发据此推迟发送
+//! （scheduler::scheduled_delay_ms）。额度查询在 quota.rs。
 
 use crate::store::ProviderConfig;
 use std::sync::OnceLock;
 use std::time::Duration;
+
+/// 激活点燃的滚动窗口时长：5 小时（毫秒）。调度推迟与激活后的窗口确认均以此为基准。
+pub(crate) const WINDOW_MS: i64 = 5 * 3600 * 1000;
 
 pub(crate) fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -126,7 +131,10 @@ mod tests {
         assert_eq!(strip_context_marker("glm-5.3-flash[1M]"), "glm-5.3-flash");
         assert_eq!(strip_context_marker("glm-5.3-flash[1m]"), "glm-5.3-flash");
         assert_eq!(strip_context_marker("glm-5.3-flash"), "glm-5.3-flash");
-        assert_eq!(strip_context_marker("  glm-5.3-flash [1M] "), "glm-5.3-flash");
+        assert_eq!(
+            strip_context_marker("  glm-5.3-flash [1M] "),
+            "glm-5.3-flash"
+        );
         assert_eq!(strip_context_marker("[1m]"), "");
         // 多字节字符结尾不能 panic
         assert_eq!(strip_context_marker("模型名上下"), "模型名上下");

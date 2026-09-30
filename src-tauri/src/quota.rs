@@ -23,6 +23,9 @@ pub struct QuotaTier {
     pub utilization: f64,
     /// 本地时区重置时间展示串，如 "09-28 15:00"
     pub resets_at: Option<String>,
+    /// 重置时间 epoch 秒（与 resets_at 同源；激活后的窗口确认用它做时间比对）
+    #[serde(default)]
+    pub resets_at_ts: Option<i64>,
     /// 金额补充说明，如 "$1.20 / $5.00"
     #[serde(default)]
     pub amount: Option<String>,
@@ -198,7 +201,8 @@ fn auth_failed(status: reqwest::StatusCode) -> String {
 }
 
 fn num(v: &serde_json::Value) -> Option<f64> {
-    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 fn num_field(obj: &serde_json::Value, field: &str) -> Option<f64> {
@@ -226,14 +230,49 @@ fn ts_to_local(n: i64) -> Option<String> {
         return None;
     }
     let ms = if n < 1_000_000_000_000 { n * 1000 } else { n };
-    chrono::DateTime::from_timestamp_millis(ms)
-        .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+    chrono::DateTime::from_timestamp_millis(ms).map(|d| {
+        d.with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string()
+    })
 }
 
 fn iso_to_local(s: &str) -> Option<String> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| {
+        d.with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string()
+    })
+}
+
+/// 重置时间统一转 epoch 秒（与 reset_display 同源），供窗口点亮确认做时间比对。
+fn reset_ts(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            if let Ok(n) = s.parse::<i64>() {
+                norm_ts(n)
+            } else {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .ok()
+                    .map(|d| d.timestamp())
+            }
+        }
+        serde_json::Value::Number(_) => v.as_i64().and_then(norm_ts),
+        _ => None,
+    }
+}
+
+fn norm_ts(n: i64) -> Option<i64> {
+    if n <= 0 {
+        return None;
+    }
+    let secs = if n < 1_000_000_000_000 { n } else { n / 1000 };
+    // 早于 2001-09 的值视为异常数据
+    if secs < 1_000_000_000 {
+        return None;
+    }
+    Some(secs)
 }
 
 // ── Kimi For Coding ─────────────────────────────────────────
@@ -243,7 +282,10 @@ async fn kimi(p: &ProviderConfig) -> Result<QuotaResult, String> {
     let key = require_key(p)?;
     let (status, text) = http_get(
         "https://api.kimi.com/coding/v1/usages",
-        &[("Authorization", format!("Bearer {key}")), ("Accept", "application/json".into())],
+        &[
+            ("Authorization", format!("Bearer {key}")),
+            ("Accept", "application/json".into()),
+        ],
     )
     .await?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -269,6 +311,7 @@ async fn kimi(p: &ProviderConfig) -> Result<QuotaResult, String> {
                     name: "五小时窗口".into(),
                     utilization: util,
                     resets_at: d.get("resetTime").and_then(reset_display),
+                    resets_at_ts: d.get("resetTime").and_then(reset_ts),
                     amount: None,
                 });
             }
@@ -286,13 +329,21 @@ async fn kimi(p: &ProviderConfig) -> Result<QuotaResult, String> {
             name: "本周额度".into(),
             utilization: util,
             resets_at: u.get("resetTime").and_then(reset_display),
+            resets_at_ts: u.get("resetTime").and_then(reset_ts),
             amount: None,
         });
     }
     if tiers.is_empty() {
         return Err("响应中没有额度数据".into());
     }
-    Ok(QuotaResult { ok: true, plan: None, tiers, balance_text: None, error: None, ts: 0 })
+    Ok(QuotaResult {
+        ok: true,
+        plan: None,
+        tiers,
+        balance_text: None,
+        error: None,
+        ts: 0,
+    })
 }
 
 // ── 智谱 GLM（个人版 / 团队版共用解析）──────────────────────
@@ -308,20 +359,32 @@ fn zhipu_tiers_from_body(
             body.get("msg").and_then(|v| v.as_str()).unwrap_or("未知")
         ));
     }
-    let data = body.get("data").ok_or_else(|| "响应缺少 data 字段".to_string())?;
-    let plan = data.get("level").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let data = body
+        .get("data")
+        .ok_or_else(|| "响应缺少 data 字段".to_string())?;
+    let plan = data
+        .get("level")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-    let mut five: Option<(f64, Option<String>)> = None;
-    let mut weekly: Option<(f64, Option<String>)> = None;
-    let mut other: Vec<(f64, Option<String>)> = Vec::new();
+    let mut five: Option<(f64, Option<String>, Option<i64>)> = None;
+    let mut weekly: Option<(f64, Option<String>, Option<i64>)> = None;
+    let mut other: Vec<(f64, Option<String>, Option<i64>)> = Vec::new();
     if let Some(limits) = data.get("limits").and_then(|v| v.as_array()) {
         for item in limits {
             let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
             if !t.eq_ignore_ascii_case("TOKENS_LIMIT") && !t.eq_ignore_ascii_case("CREDIT_LIMIT") {
                 continue;
             }
-            let util = item.get("percentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let entry = (util, item.get("nextResetTime").and_then(reset_display));
+            let util = item
+                .get("percentage")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let entry = (
+                util,
+                item.get("nextResetTime").and_then(reset_display),
+                item.get("nextResetTime").and_then(reset_ts),
+            );
             match item.get("unit").and_then(|v| v.as_i64()) {
                 Some(3) => {
                     if five.is_none() {
@@ -347,11 +410,23 @@ fn zhipu_tiers_from_body(
     }
 
     let mut tiers = Vec::new();
-    if let Some((util, reset)) = five {
-        tiers.push(QuotaTier { name: "五小时窗口".into(), utilization: util, resets_at: reset, amount: None });
+    if let Some((util, reset, ts)) = five {
+        tiers.push(QuotaTier {
+            name: "五小时窗口".into(),
+            utilization: util,
+            resets_at: reset,
+            resets_at_ts: ts,
+            amount: None,
+        });
     }
-    if let Some((util, reset)) = weekly {
-        tiers.push(QuotaTier { name: "本周额度".into(), utilization: util, resets_at: reset, amount: None });
+    if let Some((util, reset, ts)) = weekly {
+        tiers.push(QuotaTier {
+            name: "本周额度".into(),
+            utilization: util,
+            resets_at: reset,
+            resets_at_ts: ts,
+            amount: None,
+        });
     }
     if tiers.is_empty() {
         return Err("响应中没有额度数据".into());
@@ -369,7 +444,10 @@ async fn zhipu(p: &ProviderConfig) -> Result<QuotaResult, String> {
     let url = format!("{host}/api/monitor/usage/quota/limit");
     let (status, text) = http_get(
         &url,
-        &[("Authorization", key), ("Accept-Language", "en-US,en".into())],
+        &[
+            ("Authorization", key),
+            ("Accept-Language", "en-US,en".into()),
+        ],
     )
     .await?;
     if !status.is_success() {
@@ -377,7 +455,14 @@ async fn zhipu(p: &ProviderConfig) -> Result<QuotaResult, String> {
     }
     let body = parse_json(&text)?;
     let (tiers, plan) = zhipu_tiers_from_body(&body)?;
-    Ok(QuotaResult { ok: true, plan, tiers, balance_text: None, error: None, ts: 0 })
+    Ok(QuotaResult {
+        ok: true,
+        plan,
+        tiers,
+        balance_text: None,
+        error: None,
+        ts: 0,
+    })
 }
 
 /// 智谱团队版：同一 quota 路径加 ?type=2，额外携带
@@ -404,7 +489,14 @@ async fn zhipu_team(p: &ProviderConfig) -> Result<QuotaResult, String> {
     }
     let body = parse_json(&text)?;
     let (tiers, plan) = zhipu_tiers_from_body(&body)?;
-    Ok(QuotaResult { ok: true, plan, tiers, balance_text: None, error: None, ts: 0 })
+    Ok(QuotaResult {
+        ok: true,
+        plan,
+        tiers,
+        balance_text: None,
+        error: None,
+        ts: 0,
+    })
 }
 
 // ── MiniMax ─────────────────────────────────────────────────
@@ -413,10 +505,13 @@ async fn zhipu_team(p: &ProviderConfig) -> Result<QuotaResult, String> {
 
 async fn minimax(p: &ProviderConfig, is_cn: bool) -> Result<QuotaResult, String> {
     let key = require_key(p)?;
-    let domain = if is_cn { "api.minimaxi.com" } else { "api.minimax.io" };
+    let domain = if is_cn {
+        "api.minimaxi.com"
+    } else {
+        "api.minimax.io"
+    };
     let url = format!("https://{domain}/v1/api/openplatform/coding_plan/remains");
-    let (status, text) =
-        http_get(&url, &[("Authorization", format!("Bearer {key}"))]).await?;
+    let (status, text) = http_get(&url, &[("Authorization", format!("Bearer {key}"))]).await?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return Err(auth_failed(status));
     }
@@ -429,7 +524,9 @@ async fn minimax(p: &ProviderConfig, is_cn: bool) -> Result<QuotaResult, String>
         if code != 0 {
             return Err(format!(
                 "接口错误（code {code}）：{}",
-                br.get("status_msg").and_then(|v| v.as_str()).unwrap_or("未知")
+                br.get("status_msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未知")
             ));
         }
     }
@@ -437,9 +534,8 @@ async fn minimax(p: &ProviderConfig, is_cn: bool) -> Result<QuotaResult, String>
         .get("model_remains")
         .and_then(|v| v.as_array())
         .and_then(|arr| {
-            arr.iter().find(|i| {
-                i.get("model_name").and_then(|v| v.as_str()) == Some("general")
-            })
+            arr.iter()
+                .find(|i| i.get("model_name").and_then(|v| v.as_str()) == Some("general"))
         })
         .ok_or_else(|| "响应中没有 general 模型的额度数据".to_string())?;
 
@@ -452,6 +548,7 @@ async fn minimax(p: &ProviderConfig, is_cn: bool) -> Result<QuotaResult, String>
             name: "五小时窗口".into(),
             utilization: 100.0 - remain,
             resets_at: item.get("end_time").and_then(reset_display),
+            resets_at_ts: item.get("end_time").and_then(reset_ts),
             amount: None,
         });
     }
@@ -465,6 +562,7 @@ async fn minimax(p: &ProviderConfig, is_cn: bool) -> Result<QuotaResult, String>
                 name: "本周额度".into(),
                 utilization: 100.0 - remain,
                 resets_at: item.get("weekly_end_time").and_then(reset_display),
+                resets_at_ts: item.get("weekly_end_time").and_then(reset_ts),
                 amount: None,
             });
         }
@@ -472,7 +570,14 @@ async fn minimax(p: &ProviderConfig, is_cn: bool) -> Result<QuotaResult, String>
     if tiers.is_empty() {
         return Err("响应中没有额度数据".into());
     }
-    Ok(QuotaResult { ok: true, plan: None, tiers, balance_text: None, error: None, ts: 0 })
+    Ok(QuotaResult {
+        ok: true,
+        plan: None,
+        tiers,
+        balance_text: None,
+        error: None,
+        ts: 0,
+    })
 }
 
 // ── ZenMux ──────────────────────────────────────────────────
@@ -493,7 +598,10 @@ async fn zenmux(p: &ProviderConfig) -> Result<QuotaResult, String> {
     }
     let (status, text) = http_get(
         &url,
-        &[("Authorization", format!("Bearer {key}")), ("Accept", "application/json".into())],
+        &[
+            ("Authorization", format!("Bearer {key}")),
+            ("Accept", "application/json".into()),
+        ],
     )
     .await?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -506,10 +614,14 @@ async fn zenmux(p: &ProviderConfig) -> Result<QuotaResult, String> {
     if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
         return Err(format!(
             "接口错误：{}",
-            body.get("message").and_then(|v| v.as_str()).unwrap_or("未知")
+            body.get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("未知")
         ));
     }
-    let data = body.get("data").ok_or_else(|| "响应缺少 data 字段".to_string())?;
+    let data = body
+        .get("data")
+        .ok_or_else(|| "响应缺少 data 字段".to_string())?;
 
     let mut tiers = Vec::new();
     for (field, name) in [("quota_5_hour", "五小时窗口"), ("quota_7_day", "本周额度")] {
@@ -525,7 +637,11 @@ async fn zenmux(p: &ProviderConfig) -> Result<QuotaResult, String> {
         tiers.push(QuotaTier {
             name: name.into(),
             utilization: util,
-            resets_at: q.get("resets_at").and_then(|v| v.as_str()).and_then(iso_to_local),
+            resets_at: q
+                .get("resets_at")
+                .and_then(|v| v.as_str())
+                .and_then(iso_to_local),
+            resets_at_ts: q.get("resets_at").and_then(reset_ts),
             amount,
         });
     }
@@ -537,7 +653,14 @@ async fn zenmux(p: &ProviderConfig) -> Result<QuotaResult, String> {
         .and_then(|pl| pl.get("tier"))
         .and_then(|v| v.as_str())
         .map(|s| format!("ZenMux {s}"));
-    Ok(QuotaResult { ok: true, plan, tiers, balance_text: None, error: None, ts: 0 })
+    Ok(QuotaResult {
+        ok: true,
+        plan,
+        tiers,
+        balance_text: None,
+        error: None,
+        ts: 0,
+    })
 }
 
 // ── OpenCode Go ─────────────────────────────────────────────
@@ -548,7 +671,10 @@ async fn opencode_go(p: &ProviderConfig) -> Result<QuotaResult, String> {
     let key = require_key(p)?;
     let (status, text) = http_get(
         "https://opencode.ai/zen/go/v1/usage",
-        &[("Authorization", format!("Bearer {key}")), ("Accept", "application/json".into())],
+        &[
+            ("Authorization", format!("Bearer {key}")),
+            ("Accept", "application/json".into()),
+        ],
     )
     .await?;
     if status == reqwest::StatusCode::FORBIDDEN {
@@ -561,21 +687,36 @@ async fn opencode_go(p: &ProviderConfig) -> Result<QuotaResult, String> {
         return Err(format!("HTTP {status}：{}", truncate(&text, 200)));
     }
     let body = parse_json(&text)?;
-    let usage = body.get("usage").ok_or_else(|| "响应缺少 usage 字段".to_string())?;
+    let usage = body
+        .get("usage")
+        .ok_or_else(|| "响应缺少 usage 字段".to_string())?;
 
     let mut tiers = Vec::new();
-    for (field, name) in
-        [("rolling", "五小时窗口"), ("weekly", "本周额度"), ("monthly", "本月额度")]
-    {
+    for (field, name) in [
+        ("rolling", "五小时窗口"),
+        ("weekly", "本周额度"),
+        ("monthly", "本月额度"),
+    ] {
         let Some(w) = usage.get(field) else { continue };
-        let Some(pct) = w.get("percent").and_then(num) else { continue };
-        // percent 为 0 时上游的 resetsAt 是占位值，丢弃不展示
-        let resets_at = if pct > 0.0 {
-            w.get("resetsAt").and_then(reset_display)
-        } else {
-            None
+        let Some(pct) = w.get("percent").and_then(num) else {
+            continue;
         };
-        tiers.push(QuotaTier { name: name.into(), utilization: pct, resets_at, amount: None });
+        // percent 为 0 时上游的 resetsAt 是占位值，丢弃不展示
+        let (resets_at, resets_at_ts) = if pct > 0.0 {
+            (
+                w.get("resetsAt").and_then(reset_display),
+                w.get("resetsAt").and_then(reset_ts),
+            )
+        } else {
+            (None, None)
+        };
+        tiers.push(QuotaTier {
+            name: name.into(),
+            utilization: pct,
+            resets_at,
+            resets_at_ts,
+            amount: None,
+        });
     }
     if tiers.is_empty() {
         return Err("响应形态不认识（未文档化端点可能已变更）".into());
@@ -728,8 +869,16 @@ fn volc_response_error(body: &serde_json::Value) -> Option<(String, String)> {
         .get("ResponseMetadata")
         .and_then(|m| m.get("Error"))
         .or_else(|| body.get("Error"))?;
-    let code = err.get("Code").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let msg = err.get("Message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let code = err
+        .get("Code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let msg = err
+        .get("Message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     if code.is_empty() && msg.is_empty() {
         None
     } else {
@@ -799,7 +948,10 @@ async fn volc_openapi_call(
                 return VolcCall::Other(format!("接口错误（HTTP {status}，{code}）：{msg}"));
             }
         }
-        return VolcCall::Other(format!("接口错误（HTTP {status}）：{}", truncate(&raw, 200)));
+        return VolcCall::Other(format!(
+            "接口错误（HTTP {status}）：{}",
+            truncate(&raw, 200)
+        ));
     }
     let body = match serde_json::from_str::<serde_json::Value>(&raw) {
         Ok(v) => v,
@@ -832,6 +984,7 @@ fn parse_afp_tiers(result: &serde_json::Value) -> Vec<QuotaTier> {
             name: name.into(),
             utilization: used / quota * 100.0,
             resets_at: win.get("ResetTime").and_then(reset_display),
+            resets_at_ts: win.get("ResetTime").and_then(reset_ts),
             amount: Some(format!("{used:.2} / {quota:.2}")),
         });
     }
@@ -867,20 +1020,21 @@ fn parse_coding_plan_tiers(result: &serde_json::Value) -> Vec<QuotaTier> {
             .or_else(|| item.get("Label").and_then(|v| v.as_str()))
             .or_else(|| item.get("Window").and_then(|v| v.as_str()))
             .unwrap_or("");
-        let Some(name) = volc_window(label) else { continue };
+        let Some(name) = volc_window(label) else {
+            continue;
+        };
         let utilization = item
             .get("Percent")
             .and_then(num)
             .or_else(|| item.get("UsedPercent").and_then(num))
             .or_else(|| item.get("UsagePercent").and_then(num))
             .unwrap_or(0.0);
+        let reset_raw = item.get("ResetTime").or_else(|| item.get("ResetTimestamp"));
         tiers.push(QuotaTier {
             name: name.into(),
             utilization,
-            resets_at: item
-                .get("ResetTime")
-                .or_else(|| item.get("ResetTimestamp"))
-                .and_then(reset_display),
+            resets_at: reset_raw.and_then(reset_display),
+            resets_at_ts: reset_raw.and_then(reset_ts),
             amount: None,
         });
     }
@@ -913,12 +1067,16 @@ async fn volcengine(p: &ProviderConfig) -> Result<QuotaResult, String> {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(|s| format!("Agent Plan {s}"));
-                return Ok(QuotaResult { ok: true, plan, tiers, balance_text: None, error: None, ts: 0 });
+                return Ok(QuotaResult {
+                    ok: true,
+                    plan,
+                    tiers,
+                    balance_text: None,
+                    error: None,
+                    ts: 0,
+                });
             }
-            empty_responses.push(format!(
-                "GetAFPUsage={}",
-                truncate(&body.to_string(), 400)
-            ));
+            empty_responses.push(format!("GetAFPUsage={}", truncate(&body.to_string(), 400)));
         }
     }
 
@@ -963,7 +1121,10 @@ async fn deepseek(p: &ProviderConfig) -> Result<QuotaResult, String> {
     let key = require_key(p)?;
     let (status, text) = http_get(
         "https://api.deepseek.com/user/balance",
-        &[("Authorization", format!("Bearer {key}")), ("Accept", "application/json".into())],
+        &[
+            ("Authorization", format!("Bearer {key}")),
+            ("Accept", "application/json".into()),
+        ],
     )
     .await?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -973,11 +1134,17 @@ async fn deepseek(p: &ProviderConfig) -> Result<QuotaResult, String> {
         return Err(format!("HTTP {status}：{}", truncate(&text, 200)));
     }
     let body = parse_json(&text)?;
-    let is_available = body.get("is_available").and_then(|v| v.as_bool()).unwrap_or(true);
+    let is_available = body
+        .get("is_available")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let mut parts = Vec::new();
     if let Some(infos) = body.get("balance_infos").and_then(|v| v.as_array()) {
         for info in infos {
-            let currency = info.get("currency").and_then(|v| v.as_str()).unwrap_or("CNY");
+            let currency = info
+                .get("currency")
+                .and_then(|v| v.as_str())
+                .unwrap_or("CNY");
             if let Some(total) = info.get("total_balance").and_then(num) {
                 parts.push(format!("{currency} {total:.2}"));
             }
@@ -990,14 +1157,24 @@ async fn deepseek(p: &ProviderConfig) -> Result<QuotaResult, String> {
     if !is_available {
         t.push_str("（余额不足）");
     }
-    Ok(QuotaResult { ok: true, plan: None, tiers: vec![], balance_text: Some(t), error: None, ts: 0 })
+    Ok(QuotaResult {
+        ok: true,
+        plan: None,
+        tiers: vec![],
+        balance_text: Some(t),
+        error: None,
+        ts: 0,
+    })
 }
 
 async fn stepfun(p: &ProviderConfig) -> Result<QuotaResult, String> {
     let key = require_key(p)?;
     let (status, text) = http_get(
         "https://api.stepfun.com/v1/accounts",
-        &[("Authorization", format!("Bearer {key}")), ("Accept", "application/json".into())],
+        &[
+            ("Authorization", format!("Bearer {key}")),
+            ("Accept", "application/json".into()),
+        ],
     )
     .await?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -1020,10 +1197,17 @@ async fn stepfun(p: &ProviderConfig) -> Result<QuotaResult, String> {
 
 async fn siliconflow(p: &ProviderConfig, is_cn: bool) -> Result<QuotaResult, String> {
     let key = require_key(p)?;
-    let domain = if is_cn { "api.siliconflow.cn" } else { "api.siliconflow.com" };
+    let domain = if is_cn {
+        "api.siliconflow.cn"
+    } else {
+        "api.siliconflow.com"
+    };
     let (status, text) = http_get(
         &format!("https://{domain}/v1/user/info"),
-        &[("Authorization", format!("Bearer {key}")), ("Accept", "application/json".into())],
+        &[
+            ("Authorization", format!("Bearer {key}")),
+            ("Accept", "application/json".into()),
+        ],
     )
     .await?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -1033,10 +1217,16 @@ async fn siliconflow(p: &ProviderConfig, is_cn: bool) -> Result<QuotaResult, Str
         return Err(format!("HTTP {status}：{}", truncate(&text, 200)));
     }
     let body = parse_json(&text)?;
-    let data = body.get("data").ok_or_else(|| "响应缺少 data 字段".to_string())?;
+    let data = body
+        .get("data")
+        .ok_or_else(|| "响应缺少 data 字段".to_string())?;
     let total = num_field(data, "totalBalance").unwrap_or(0.0);
     let unit = if is_cn { "CNY" } else { "USD" };
-    let label = if is_cn { "SiliconFlow" } else { "SiliconFlow (EN)" };
+    let label = if is_cn {
+        "SiliconFlow"
+    } else {
+        "SiliconFlow (EN)"
+    };
     Ok(QuotaResult {
         ok: true,
         plan: None,
@@ -1051,7 +1241,10 @@ async fn openrouter(p: &ProviderConfig) -> Result<QuotaResult, String> {
     let key = require_key(p)?;
     let (status, text) = http_get(
         "https://openrouter.ai/api/v1/credits",
-        &[("Authorization", format!("Bearer {key}")), ("Accept", "application/json".into())],
+        &[
+            ("Authorization", format!("Bearer {key}")),
+            ("Accept", "application/json".into()),
+        ],
     )
     .await?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -1081,7 +1274,10 @@ async fn novita(p: &ProviderConfig) -> Result<QuotaResult, String> {
     let key = require_key(p)?;
     let (status, text) = http_get(
         "https://api.novita.ai/v3/user/balance",
-        &[("Authorization", format!("Bearer {key}")), ("Accept", "application/json".into())],
+        &[
+            ("Authorization", format!("Bearer {key}")),
+            ("Accept", "application/json".into()),
+        ],
     )
     .await?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -1110,19 +1306,37 @@ mod tests {
     #[test]
     fn test_detect_kind() {
         use Kind::*;
-        assert_eq!(detect_kind("https://open.bigmodel.cn/api/anthropic"), Some(Zhipu));
+        assert_eq!(
+            detect_kind("https://open.bigmodel.cn/api/anthropic"),
+            Some(Zhipu)
+        );
         assert_eq!(detect_kind("https://api.z.ai/api/anthropic"), Some(Zhipu));
         assert_eq!(detect_kind("https://api.kimi.com/coding/"), Some(Kimi));
-        assert_eq!(detect_kind("https://api.minimax.cn/anthropic"), Some(MiniMaxCn));
-        assert_eq!(detect_kind("https://api.minimax.io/anthropic"), Some(MiniMaxEn));
+        assert_eq!(
+            detect_kind("https://api.minimax.cn/anthropic"),
+            Some(MiniMaxCn)
+        );
+        assert_eq!(
+            detect_kind("https://api.minimax.io/anthropic"),
+            Some(MiniMaxEn)
+        );
         assert_eq!(detect_kind("https://opencode.ai/zen/go"), Some(OpencodeGo));
         assert_eq!(
             detect_kind("https://ark.cn-beijing.volces.com/api/plan/v3"),
             Some(Volcengine)
         );
-        assert_eq!(detect_kind("https://api.deepseek.com/anthropic"), Some(DeepSeek));
-        assert_eq!(detect_kind("https://api.siliconflow.cn/v1"), Some(SiliconFlowCn));
-        assert_eq!(detect_kind("https://openrouter.ai/api/v1"), Some(OpenRouter));
+        assert_eq!(
+            detect_kind("https://api.deepseek.com/anthropic"),
+            Some(DeepSeek)
+        );
+        assert_eq!(
+            detect_kind("https://api.siliconflow.cn/v1"),
+            Some(SiliconFlowCn)
+        );
+        assert_eq!(
+            detect_kind("https://openrouter.ai/api/v1"),
+            Some(OpenRouter)
+        );
         assert_eq!(detect_kind("https://api.novita.ai/v3"), Some(Novita));
         assert_eq!(detect_kind("https://api.moonshot.cn/anthropic"), None);
     }
@@ -1142,6 +1356,7 @@ mod tests {
         assert!((tiers[0].utilization - 12.5).abs() < 1e-9);
         assert_eq!(tiers[1].name, "本周额度");
         assert!(tiers[0].resets_at.is_some());
+        assert_eq!(tiers[0].resets_at_ts, Some(1759000000));
     }
 
     #[test]
@@ -1160,6 +1375,33 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_ts() {
+        // 秒级 / 毫秒级时间戳归一到秒
+        assert_eq!(
+            reset_ts(&serde_json::json!(1759000000i64)),
+            Some(1759000000)
+        );
+        assert_eq!(
+            reset_ts(&serde_json::json!(1759000000000i64)),
+            Some(1759000000)
+        );
+        // ISO 字符串
+        assert_eq!(
+            reset_ts(&serde_json::json!("2026-09-28T15:00:00Z")),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-09-28T15:00:00Z")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+        // 0 / 负数 / 非法 / 异常小的值视为无
+        assert_eq!(reset_ts(&serde_json::json!(0)), None);
+        assert_eq!(reset_ts(&serde_json::json!(-1)), None);
+        assert_eq!(reset_ts(&serde_json::json!("abc")), None);
+        assert_eq!(reset_ts(&serde_json::json!(123456i64)), None);
+    }
+
+    #[test]
     fn test_volc_uri_encode() {
         assert_eq!(volc_uri_encode("a b+c/d"), "a%20b%2Bc%2Fd");
         assert_eq!(volc_uri_encode("Action"), "Action");
@@ -1168,8 +1410,14 @@ mod tests {
 
     #[test]
     fn test_volc_region() {
-        assert_eq!(volc_region("https://ark.cn-beijing.volces.com/api/plan/v3"), "cn-beijing");
-        assert_eq!(volc_region("https://ark.ap-southeast.volces.com/api/coding"), "ap-southeast");
+        assert_eq!(
+            volc_region("https://ark.cn-beijing.volces.com/api/plan/v3"),
+            "cn-beijing"
+        );
+        assert_eq!(
+            volc_region("https://ark.ap-southeast.volces.com/api/coding"),
+            "ap-southeast"
+        );
         assert_eq!(volc_region("https://example.com"), VOLC_DEFAULT_REGION);
     }
 
