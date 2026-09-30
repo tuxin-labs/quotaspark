@@ -111,13 +111,23 @@ pub fn read_cc_providers() -> Result<(Vec<CcProvider>, usize), String> {
     Ok((out, skipped))
 }
 
+/// parse_usage_config 返回的六元组：(plan_type, usage_url, ak, sk, org, proj)
+type UsageCredentials = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 /// 从 meta JSON 里取 usage_script 的额度查询凭据，映射到本工具的
 /// ProviderConfig 字段。返回 (plan_type, usage_url, ak, sk, org, proj)。
 /// 与 cc-switch 的字段名（camelCase）保持一致：
 /// - templateType == "token_plan" 且 codingPlanProvider == "zhipu_team" → plan_type
 /// - templateType == "token_plan" 的 baseUrl 是 ZenMux 用量端点
 /// - accessKeyId / secretAccessKey / teamOrganizationId / teamProjectId 直取
-fn parse_usage_config(meta_json: &str) -> (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) {
+fn parse_usage_config(meta_json: &str) -> UsageCredentials {
     let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_json) else {
         return (None, None, None, None, None, None);
     };
@@ -182,7 +192,10 @@ mod tests {
         }}"#;
         let (plan_type, usage_url, ak, _sk, _org, _proj) = parse_usage_config(meta);
         assert_eq!(plan_type, None);
-        assert_eq!(usage_url.as_deref(), Some("https://api.zenmux.com/v1/usage"));
+        assert_eq!(
+            usage_url.as_deref(),
+            Some("https://api.zenmux.com/v1/usage")
+        );
         assert_eq!(ak, None);
     }
 
