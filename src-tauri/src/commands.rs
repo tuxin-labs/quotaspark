@@ -7,6 +7,7 @@ use crate::state::{log_and_emit, now_ms, AppState, Inner};
 use crate::store::{LogEntry, ProviderConfig};
 use chrono::NaiveTime;
 use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_autostart::ManagerExt;
@@ -26,8 +27,14 @@ pub struct ProviderCard {
     pub supports_quota: bool,
 }
 
+/// 进程内单调递增序号：同一次同步导入会在极短时间内连续生成多个 id，
+/// Windows 时钟粒度粗于微秒，仅靠时间戳会在同一微秒内碰撞
+/// （曾导致两个供应商共享同一 id，统计串显、删除连带）。
+static ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn new_id() -> String {
-    format!("p_{}", chrono::Utc::now().timestamp_micros())
+    let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("p_{}_{}", chrono::Utc::now().timestamp_micros(), seq)
 }
 
 fn opt_trim(v: Option<String>) -> Option<String> {
@@ -272,6 +279,21 @@ pub fn delete_provider(app: AppHandle, state: tauri::State<AppState>, id: String
         },
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::new_id;
+    use std::collections::HashSet;
+
+    /// 回归测试：同步导入循环会在极短时间内连续生成多个 id，
+    /// 微秒时间戳在同一微秒内会碰撞，id 必须附加进程内单调序号保证唯一。
+    #[test]
+    fn rapid_new_id_calls_are_unique() {
+        const N: usize = 200_000;
+        let ids: HashSet<String> = (0..N).map(|_| new_id()).collect();
+        assert_eq!(ids.len(), N, "快速连续生成时 new_id 产生了重复 id");
+    }
 }
 
 #[tauri::command]
