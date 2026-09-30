@@ -286,21 +286,6 @@ pub fn delete_provider(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::new_id;
-    use std::collections::HashSet;
-
-    /// 回归测试：同步导入循环会在极短时间内连续生成多个 id，
-    /// 微秒时间戳在同一微秒内会碰撞，id 必须附加进程内单调序号保证唯一。
-    #[test]
-    fn rapid_new_id_calls_are_unique() {
-        const N: usize = 200_000;
-        let ids: HashSet<String> = (0..N).map(|_| new_id()).collect();
-        assert_eq!(ids.len(), N, "快速连续生成时 new_id 产生了重复 id");
-    }
-}
-
 #[tauri::command]
 pub fn set_schedule(
     app: AppHandle,
@@ -647,5 +632,16 @@ mod tests {
         // 按量余额类（没有五小时窗口档位）与查询失败 → 不做确认
         assert!(window_confirm(&q_ok(vec![]), Some(expected)).is_none());
         assert!(window_confirm(&quota::QuotaResult::default(), Some(expected)).is_none());
+    }
+
+    /// 回归测试：同步导入循环会在极短时间内连续生成多个 id，
+    /// 微秒时间戳在同一微秒内会碰撞，id 必须附加进程内单调序号保证唯一。
+    #[test]
+    fn rapid_new_id_calls_are_unique() {
+        use std::collections::HashSet;
+
+        const N: usize = 200_000;
+        let ids: HashSet<String> = (0..N).map(|_| new_id()).collect();
+        assert_eq!(ids.len(), N, "快速连续生成时 new_id 产生了重复 id");
     }
 }
