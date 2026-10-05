@@ -26,6 +26,12 @@ const BLANK: ProviderConfig = {
   team_project_id: null,
 };
 
+/** 与 src-tauri/src/quota.rs detect_kind 的支持名单保持一致 */
+export const QUOTA_SUPPORTED_HINT =
+  "支持自动查额度：Kimi For Coding、智谱 GLM（个人版/团队版）、MiniMax、" +
+  "OpenCode Go、火山方舟 Agent/Coding Plan、ZenMux；按量余额类：DeepSeek、" +
+  "StepFun、SiliconFlow、OpenRouter、Novita AI。其余域名暂不支持，激活不受影响。";
+
 export default function ProviderForm({ initial, onClose, onSaved }: Props) {
   const [p, setP] = useState<ProviderConfig>(initial ?? BLANK);
   const [err, setErr] = useState("");
@@ -99,6 +105,12 @@ export default function ProviderForm({ initial, onClose, onSaved }: Props) {
 
         <details className="advanced">
           <summary>额度查询高级配置（智谱团队 / 火山方舟 / ZenMux 才需要）</summary>
+          <p className="adv-hint">{QUOTA_SUPPORTED_HINT}</p>
+          <p className="adv-hint">
+            火山方舟 AK/SK、ZenMux 用量端点的输入框，会在上方 Base URL
+            填入对应地址（volces.com/api/plan、/api/coding 或含 zenmux）后自动出现；
+            智谱团队版勾选后填写组织/项目 ID；其余供应商查额度直接用上方 API Key，无需额外配置。
+          </p>
           <label className="check">
             <input
               type="checkbox"

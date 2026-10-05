@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type LogEntry, type ProviderCard, type ProviderConfig, type SyncReport, type QuotaTier } from "./api";
-import ProviderForm from "./ProviderForm";
+import ProviderForm, { QUOTA_SUPPORTED_HINT } from "./ProviderForm";
 import UpdateButton from "./UpdateButton";
 import "./App.css";
 
@@ -417,7 +417,7 @@ export default function App() {
             <div className="quota" data-testid="quota-panel">
               {!p.supports_quota ? (
                 // 域名不在支持清单里：查询必报"未识别"，直接不给查询入口
-                <div className="quota-unsupported">
+                <div className="quota-unsupported" title={QUOTA_SUPPORTED_HINT}>
                   该供应商不支持自动查额度（激活不受影响）
                 </div>
               ) : p.quota?.ok ? (

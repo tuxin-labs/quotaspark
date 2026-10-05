@@ -879,6 +879,13 @@ button.danger {
   margin-bottom: 13px;
 }
 
+.adv-hint {
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.7;
+  margin: 0 0 10px;
+}
+
 .hint {
   color: var(--muted);
   font-size: 11.5px;
