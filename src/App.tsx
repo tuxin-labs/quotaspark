@@ -297,6 +297,7 @@ export default function App() {
   const [confirmDel, setConfirmDel] = useState<ProviderCard | null>(null);
   const [autostart, setAutostart] = useState(false);
   const [querying, setQuerying] = useState<Record<string, boolean>>({});
+  const [refreshingAll, setRefreshingAll] = useState(false);
   const [themeMode, cycleTheme] = useThemeCycle();
   const themeLabel = themeMode === "auto" ? "跟随系统" : themeMode === "dark" ? "深色" : "浅色";
 
@@ -336,6 +337,27 @@ export default function App() {
       console.error(e);
     } finally {
       setQuerying((m) => ({ ...m, [id]: false }));
+    }
+  };
+
+  // 全部刷新：并行重查所有支持额度的供应商，各卡片同时进入"查询中…"。
+  // 单个失败不影响其余（结果由后端写入状态后逐个 emit 刷新）。
+  const onRefreshAll = async () => {
+    if (refreshingAll) return;
+    const ids = providers.filter((p) => p.supports_quota).map((p) => p.id);
+    if (!ids.length) {
+      showNotice("没有支持自动查额度的供应商");
+      return;
+    }
+    setRefreshingAll(true);
+    setQuerying((m) => Object.fromEntries([...Object.entries(m), ...ids.map((id) => [id, true])]));
+    try {
+      await Promise.allSettled(ids.map((id) => api.queryQuota(id)));
+      showNotice(`已刷新 ${ids.length} 个供应商的额度`);
+    } finally {
+      setQuerying((m) => Object.fromEntries(Object.entries(m).filter(([k]) => !ids.includes(k))));
+      setRefreshingAll(false);
+      refresh();
     }
   };
 
@@ -408,6 +430,14 @@ export default function App() {
           <UpdateButton onNotice={showNotice} />
           <button onClick={onSync} data-testid="sync-btn">同步 cc-switch 配置</button>
           <button onClick={() => setEditing(null)} data-testid="add-btn">＋ 手动添加</button>
+          <button
+            data-testid="refresh-all-btn"
+            title="重新查询全部供应商的额度"
+            disabled={refreshingAll}
+            onClick={onRefreshAll}
+          >
+            {refreshingAll ? "刷新中…" : "↻ 全部刷新"}
+          </button>
           <button className="primary" onClick={onActivateAll} data-testid="activate-all-btn">全部激活</button>
         </div>
       </div>
