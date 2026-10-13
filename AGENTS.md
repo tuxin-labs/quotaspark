@@ -33,7 +33,7 @@ cd src-tauri && cargo fmt && cargo clippy -- -D warnings   # 须零警告
 - `src-tauri/src/`：
   - `commands.rs` — Tauri 命令层（前端 invoke 入口），保持薄，业务逻辑放对应模块
   - `engine.rs` — 激活引擎；模型名会剥掉 cc-switch 的 `[1M]` 后缀
-  - `quota.rs` — 12 家供应商额度/余额查询（端点与解析移植自 cc-switch）
+  - `quota.rs` — 13 家供应商额度/余额查询（端点与解析移植自 cc-switch，含 Command Code）
   - `scheduler.rs` — 30s tick 调度 + 触发去重（去重键持久化在配置，重启不重发）
   - `cc_sync.rs` — 同步 `~/.cc-switch/cc-switch.db`
   - `store.rs` / `state.rs` — `~/.cc-activator/config.json` 持久化（原子写入）与全局状态

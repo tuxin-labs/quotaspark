@@ -29,7 +29,7 @@ const BLANK: ProviderConfig = {
 /** 与 src-tauri/src/quota.rs detect_kind 的支持名单保持一致 */
 export const QUOTA_SUPPORTED_HINT =
   "支持自动查额度：Kimi For Coding、智谱 GLM（个人版/团队版）、MiniMax、" +
-  "OpenCode Go、火山方舟 Agent/Coding Plan、ZenMux；按量余额类：DeepSeek、" +
+  "OpenCode Go、Command Code、火山方舟 Agent/Coding Plan、ZenMux；按量余额类：DeepSeek、" +
   "StepFun、SiliconFlow、OpenRouter、Novita AI。其余域名暂不支持，激活不受影响。";
 
 export default function ProviderForm({ initial, onClose, onSaved }: Props) {

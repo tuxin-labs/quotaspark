@@ -3,7 +3,8 @@
 //! 按 base_url 自动检测：
 //! - Coding Plan（窗口百分比）：Kimi For Coding、智谱 GLM 个人版（bigmodel.cn /
 //!   api.z.ai）、智谱团队版（需显式指定 + 组织/项目 ID）、MiniMax（中/英）、
-//!   ZenMux（需填用量端点 URL）、OpenCode Go、火山方舟 Agent/Coding Plan（需账号 AK/SK）
+//!   ZenMux（需填用量端点 URL）、OpenCode Go、Command Code、
+//!   火山方舟 Agent/Coding Plan（需账号 AK/SK）
 //! - 按量余额：DeepSeek、StepFun、SiliconFlow（中/英）、OpenRouter、Novita AI
 //!
 //! 官方 OAuth 订阅（Claude / ChatGPT / Gemini / Copilot / xAI）依赖 cc-switch 的
@@ -53,6 +54,7 @@ pub enum Kind {
     MiniMaxEn,
     ZenMux,
     OpencodeGo,
+    CommandCode,
     Volcengine,
     DeepSeek,
     StepFun,
@@ -75,6 +77,8 @@ pub fn detect_kind(base_url: &str) -> Option<Kind> {
         Some(Kind::MiniMaxEn)
     } else if u.contains("opencode.ai/zen/go") {
         Some(Kind::OpencodeGo)
+    } else if u.contains("api.commandcode.ai/provider") {
+        Some(Kind::CommandCode)
     } else if u.contains("volces.com/api/plan") || u.contains("volces.com/api/coding") {
         Some(Kind::Volcengine)
     } else if u.contains("zenmux") {
@@ -105,6 +109,7 @@ pub fn detect_label(kind: Kind) -> &'static str {
         Kind::MiniMaxCn | Kind::MiniMaxEn => "MiniMax Coding Plan",
         Kind::ZenMux => "ZenMux",
         Kind::OpencodeGo => "OpenCode Go",
+        Kind::CommandCode => "Command Code",
         Kind::Volcengine => "火山方舟 Agent/Coding Plan",
         Kind::DeepSeek => "DeepSeek（按量）",
         Kind::StepFun => "StepFun（按量）",
@@ -151,6 +156,7 @@ async fn dispatch(p: &ProviderConfig) -> Result<QuotaResult, String> {
         Kind::MiniMaxEn => minimax(p, false).await,
         Kind::ZenMux => zenmux(p).await,
         Kind::OpencodeGo => opencode_go(p).await,
+        Kind::CommandCode => command_code(p).await,
         Kind::Volcengine => volcengine(p).await,
         Kind::DeepSeek => deepseek(p).await,
         Kind::StepFun => stepfun(p).await,
@@ -731,6 +737,183 @@ async fn opencode_go(p: &ProviderConfig) -> Result<QuotaResult, String> {
     })
 }
 
+// ── Command Code ────────────────────────────────────────────
+// 额度与窗口接口由官方 CLI 使用、未公开文档化（移植自 cc-switch）。
+// `/alpha` 控制面固定在根域名，推理数据面才是 `/provider`(`/provider/v1`)，
+// 因此查询不复用 base_url。流程：whoami 取 orgId → credits / subscriptions，
+// usage/summary 以订阅期起点为 since 取 totalCost；5h/周滚动窗口仅在
+// windowLimits.limited=true 时返回，月度池按 已花/（已花+剩余credits） 计。
+
+const COMMAND_CODE_API_BASE: &str = "https://api.commandcode.ai";
+
+fn command_code_url(path: &str, params: &[(&str, &str)]) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(&format!("{COMMAND_CODE_API_BASE}{path}"))
+        .map_err(|e| format!("Command Code 端点非法：{e}"))?;
+    {
+        let mut query = url.query_pairs_mut();
+        for (k, v) in params {
+            query.append_pair(k, v);
+        }
+    }
+    Ok(url.into())
+}
+
+async fn command_code_get(
+    path: &str,
+    params: &[(&str, &str)],
+    key: &str,
+) -> Result<serde_json::Value, String> {
+    let url = command_code_url(path, params)?;
+    let (status, text) = http_get(
+        &url,
+        &[
+            ("Authorization", format!("Bearer {key}")),
+            ("Accept", "application/json".into()),
+        ],
+    )
+    .await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(auth_failed(status));
+    }
+    if !status.is_success() {
+        return Err(format!("HTTP {status}：{}", truncate(&text, 200)));
+    }
+    parse_json(&text)
+}
+
+fn command_code_window_tier(window: Option<&serde_json::Value>, name: &str) -> Option<QuotaTier> {
+    let window = window?;
+    let used = window.get("used").and_then(num)?;
+    let cap = window.get("cap").and_then(num)?;
+    if cap <= 0.0 {
+        return None;
+    }
+    Some(QuotaTier {
+        name: name.into(),
+        utilization: used / cap * 100.0,
+        resets_at: window.get("resetAt").and_then(reset_display),
+        resets_at_ts: window.get("resetAt").and_then(reset_ts),
+        amount: None,
+    })
+}
+
+fn parse_command_code_quota(
+    credits_response: &serde_json::Value,
+    subscription_response: Option<&serde_json::Value>,
+    summary_response: &serde_json::Value,
+) -> Result<QuotaResult, String> {
+    let credit_root = credits_response
+        .get("credits")
+        .filter(|v| !v.is_null())
+        .ok_or_else(|| "响应缺少 credits 字段（未文档化端点可能已变更）".to_string())?;
+
+    // 月度 tier 是套餐级月度额度：purchased/free credits 只参与月度百分比，
+    // 不参与 5h/周滚动窗口（与 OpenCode Go 一致，展示三类窗口 + 重置时间）
+    let monthly_remaining = credit_root
+        .get("monthlyCredits")
+        .and_then(num)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let purchased_remaining = credit_root
+        .get("purchasedCredits")
+        .and_then(num)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let free_remaining = credit_root
+        .get("freeCredits")
+        .and_then(num)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let total_remaining = monthly_remaining + purchased_remaining + free_remaining;
+    let total_spent = summary_response
+        .get("totalCost")
+        .and_then(num)
+        .ok_or_else(|| "响应缺少 totalCost 字段（未文档化端点可能已变更）".to_string())?
+        .max(0.0);
+    let total_pool = total_spent + total_remaining;
+
+    let subscription = subscription_response.and_then(|b| b.get("data"));
+    let period_end = subscription.and_then(|d| d.get("currentPeriodEnd"));
+    let plan = subscription
+        .and_then(|d| d.get("planId"))
+        .and_then(|v| v.as_str())
+        .or_else(|| credit_root.get("planId").and_then(|v| v.as_str()))
+        .map(str::to_string);
+
+    let mut tiers = Vec::new();
+    // 实际响应把 windowLimits 放在 credits 同级；保留嵌套位置兼容已出现过的变体
+    if let Some(window_limits) = credits_response
+        .get("windowLimits")
+        .or_else(|| credit_root.get("windowLimits"))
+    {
+        if window_limits
+            .get("limited")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            tiers.extend(command_code_window_tier(
+                window_limits.get("fiveHour"),
+                "五小时窗口",
+            ));
+            tiers.extend(command_code_window_tier(
+                window_limits.get("weekly"),
+                "本周额度",
+            ));
+        }
+    }
+    tiers.push(QuotaTier {
+        name: "本月额度".into(),
+        utilization: if total_pool > 0.0 {
+            total_spent / total_pool * 100.0
+        } else {
+            0.0
+        },
+        resets_at: period_end.and_then(reset_display),
+        resets_at_ts: period_end.and_then(reset_ts),
+        amount: None,
+    });
+
+    Ok(QuotaResult {
+        ok: true,
+        plan,
+        tiers,
+        balance_text: None,
+        error: None,
+        ts: 0,
+    })
+}
+
+async fn command_code(p: &ProviderConfig) -> Result<QuotaResult, String> {
+    let key = require_key(p)?;
+    let whoami = command_code_get("/alpha/whoami", &[("limits", "1")], &key).await?;
+    let org_id = whoami
+        .get("org")
+        .and_then(|org| org.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let org_params: Vec<(&str, &str)> = org_id
+        .as_deref()
+        .map(|id| vec![("orgId", id)])
+        .unwrap_or_default();
+
+    let credits = command_code_get("/alpha/billing/credits", &org_params, &key).await?;
+    let subscription = command_code_get("/alpha/billing/subscriptions", &org_params, &key).await?;
+    let period_start = subscription
+        .get("data")
+        .and_then(|d| d.get("currentPeriodStart"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let mut summary_params: Vec<(&str, &str)> = Vec::new();
+    if let Some(since) = period_start.as_deref() {
+        summary_params.push(("since", since));
+    }
+    if let Some(id) = org_id.as_deref() {
+        summary_params.push(("orgId", id));
+    }
+    let summary = command_code_get("/alpha/usage/summary", &summary_params, &key).await?;
+    parse_command_code_quota(&credits, Some(&subscription), &summary)
+}
+
 // ── 火山方舟 Agent Plan / Coding Plan ───────────────────────
 //
 // 控制面 OpenAPI（open.volcengineapi.com），强制火山签名 V4（AK/SK）——
@@ -1254,20 +1437,33 @@ async fn openrouter(p: &ProviderConfig) -> Result<QuotaResult, String> {
         return Err(format!("HTTP {status}：{}", truncate(&text, 200)));
     }
     let body = parse_json(&text)?;
-    let data = body.get("data").unwrap_or(&body);
-    let total_credits = num_field(data, "total_credits").unwrap_or(0.0);
-    let total_usage = num_field(data, "total_usage").unwrap_or(0.0);
-    let remaining = total_credits - total_usage;
-    Ok(QuotaResult {
+    parse_openrouter_balance(&body).map(|balance_text| QuotaResult {
         ok: true,
         plan: None,
         tiers: vec![],
-        balance_text: Some(format!(
-            "OpenRouter 余额：{remaining:.2} USD（充值 {total_credits:.2}，已用 {total_usage:.2}）"
-        )),
+        balance_text: Some(balance_text),
         error: None,
         ts: 0,
     })
+}
+
+/// /credits 返回的是购买额度而非 Key 有效性：免费账户余额为 0 仍可用免费模型，
+/// 不影响展示。字段缺失或非有限数值一律报错，绝不静默按 0 显示（cc-switch #8175）。
+fn parse_openrouter_balance(body: &serde_json::Value) -> Result<String, String> {
+    let data = body.get("data").unwrap_or(body);
+    let (Some(total_credits), Some(total_usage)) = (
+        num_field(data, "total_credits").filter(|v| v.is_finite()),
+        num_field(data, "total_usage").filter(|v| v.is_finite()),
+    ) else {
+        return Err("响应缺少或含非法的 total_credits / total_usage".into());
+    };
+    let remaining = total_credits - total_usage;
+    if !remaining.is_finite() {
+        return Err("OpenRouter 余额数值非法".into());
+    }
+    Ok(format!(
+        "OpenRouter 余额：{remaining:.2} USD（充值 {total_credits:.2}，已用 {total_usage:.2}）"
+    ))
 }
 
 async fn novita(p: &ProviderConfig) -> Result<QuotaResult, String> {
@@ -1287,16 +1483,26 @@ async fn novita(p: &ProviderConfig) -> Result<QuotaResult, String> {
         return Err(format!("HTTP {status}：{}", truncate(&text, 200)));
     }
     let body = parse_json(&text)?;
-    // 金额单位为 0.0001 USD，除以 10000 转为 USD
-    let available = num_field(&body, "availableBalance").unwrap_or(0.0) / 10000.0;
-    Ok(QuotaResult {
+    parse_novita_balance(&body).map(|balance_text| QuotaResult {
         ok: true,
         plan: None,
         tiers: vec![],
-        balance_text: Some(format!("Novita AI 余额：{available:.2} USD")),
+        balance_text: Some(balance_text),
         error: None,
         ts: 0,
     })
+}
+
+/// 金额单位为 0.0001 USD，除以 10000 转为 USD。余额为 0 不代表 Key 失效；
+/// 字段缺失或非法（含 NaN/inf）直接报错，不静默按 0 显示（移植自 cc-switch）。
+fn parse_novita_balance(body: &serde_json::Value) -> Result<String, String> {
+    let Some(available) = num_field(body, "availableBalance")
+        .map(|v| v / 10000.0)
+        .filter(|v| v.is_finite())
+    else {
+        return Err("响应缺少或含非法的 availableBalance".into());
+    };
+    Ok(format!("Novita AI 余额：{available:.2} USD"))
 }
 
 #[cfg(test)]
@@ -1427,5 +1633,151 @@ mod tests {
         assert_eq!(volc_window("weekly"), Some("本周额度"));
         assert_eq!(volc_window("monthly"), Some("本月额度"));
         assert_eq!(volc_window("daily"), None);
+    }
+
+    #[test]
+    fn test_detect_command_code() {
+        use Kind::*;
+        assert_eq!(
+            detect_kind("https://api.commandcode.ai/provider"),
+            Some(CommandCode)
+        );
+        assert_eq!(
+            detect_kind("https://api.commandcode.ai/provider/v1"),
+            Some(CommandCode)
+        );
+    }
+
+    fn cc_credits_body(limited: bool, nested: bool) -> serde_json::Value {
+        let window_limits = serde_json::json!({
+            "limited": limited,
+            "fiveHour": { "used": 2.5, "cap": 10.0, "resetAt": "2026-10-13T03:00:00Z" },
+            "weekly": { "used": 30.0, "cap": 100.0, "resetAt": "2026-10-19T00:00:00Z" },
+        });
+        let mut root = serde_json::json!({
+            "credits": {
+                "monthlyCredits": 60.0,
+                "purchasedCredits": 30.0,
+                "freeCredits": 10.0,
+                "planId": "pro",
+            }
+        });
+        if nested {
+            // 历史变体：windowLimits 嵌在 credits 里
+            root["credits"]["windowLimits"] = window_limits;
+        } else {
+            // 实际响应把 windowLimits 放在 credits 同级
+            root["windowLimits"] = window_limits;
+        }
+        root
+    }
+
+    fn cc_summary(spent: f64) -> serde_json::Value {
+        serde_json::json!({ "totalCost": spent })
+    }
+
+    #[test]
+    fn test_command_code_limited_shows_all_windows() {
+        let subscription = serde_json::json!({
+            "data": { "planId": "pro-max", "currentPeriodEnd": "2026-11-01T00:00:00Z" }
+        });
+        let r = parse_command_code_quota(
+            &cc_credits_body(true, false),
+            Some(&subscription),
+            &cc_summary(25.0),
+        )
+        .unwrap();
+        assert_eq!(r.plan.as_deref(), Some("pro-max"));
+        assert_eq!(r.tiers.len(), 3);
+        assert_eq!(r.tiers[0].name, "五小时窗口");
+        assert!((r.tiers[0].utilization - 25.0).abs() < 1e-9);
+        assert!(r.tiers[0].resets_at.is_some() && r.tiers[0].resets_at_ts.is_some());
+        assert_eq!(r.tiers[1].name, "本周额度");
+        assert!((r.tiers[1].utilization - 30.0).abs() < 1e-9);
+        // 月度池 = 已花 25 /（已花 25 + 剩余 100）= 20%
+        assert_eq!(r.tiers[2].name, "本月额度");
+        assert!((r.tiers[2].utilization - 20.0).abs() < 1e-9);
+        assert!(r.tiers[2].resets_at.is_some() && r.tiers[2].resets_at_ts.is_some());
+    }
+
+    #[test]
+    fn test_command_code_unlimited_only_monthly_and_nested_variant() {
+        let r = parse_command_code_quota(&cc_credits_body(false, true), None, &cc_summary(0.0))
+            .unwrap();
+        assert_eq!(r.tiers.len(), 1);
+        assert_eq!(r.tiers[0].name, "本月额度");
+        assert_eq!(r.tiers[0].utilization, 0.0);
+        // 无订阅响应时 planId 回退到 credits 内
+        assert_eq!(r.plan.as_deref(), Some("pro"));
+        assert!(r.tiers[0].resets_at.is_none());
+    }
+
+    #[test]
+    fn test_command_code_rejects_missing_fields() {
+        for (credits, summary) in [
+            (serde_json::json!({}), cc_summary(1.0)),
+            (cc_credits_body(true, false), serde_json::json!({})),
+            (serde_json::json!({ "credits": null }), cc_summary(1.0)),
+        ] {
+            assert!(
+                parse_command_code_quota(&credits, None, &summary).is_err(),
+                "should reject {credits}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openrouter_balance_parse() {
+        // 正常 / 数值字符串 / 无 data 包裹 三种形态都要出正确金额
+        for body in [
+            serde_json::json!({ "data": { "total_credits": 100.0, "total_usage": 25.5 } }),
+            serde_json::json!({ "total_credits": "100.00", "total_usage": "25.50" }),
+        ] {
+            let text = parse_openrouter_balance(&body).unwrap();
+            assert!(text.contains("余额：74.50 USD"), "{text}");
+            assert!(text.contains("充值 100.00"), "{text}");
+        }
+        // 免费账户：余额为 0 是合法展示，不是错误
+        let text = parse_openrouter_balance(&serde_json::json!(
+            { "data": { "total_credits": 0.0, "total_usage": 0.0 } }
+        ))
+        .unwrap();
+        assert!(text.contains("余额：0.00 USD"), "{text}");
+        // 字段缺失 / 非法 / 非有限值 一律报错
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "data": null }),
+            serde_json::json!({ "data": { "limit": 100, "limit_remaining": 100 } }),
+            serde_json::json!({ "data": { "total_credits": 100.0 } }),
+            serde_json::json!({ "data": { "total_credits": "NaN", "total_usage": 0.0 } }),
+            serde_json::json!({ "data": { "total_credits": 1e308, "total_usage": -1e308 } }),
+        ] {
+            assert!(parse_openrouter_balance(&body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn test_novita_balance_parse() {
+        for (raw, expect) in [
+            (0.0, "余额：0.00 USD"),
+            (-50000.0, "余额：-5.00 USD"),
+            (255000.0, "余额：25.50 USD"),
+        ] {
+            let text =
+                parse_novita_balance(&serde_json::json!({ "availableBalance": raw })).unwrap();
+            assert!(text.contains(expect), "{text}");
+        }
+        let text =
+            parse_novita_balance(&serde_json::json!({ "availableBalance": "10000" })).unwrap();
+        assert!(text.contains("余额：1.00 USD"), "{text}");
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "availableBalance": null }),
+            serde_json::json!({ "availableBalance": "invalid" }),
+            serde_json::json!({ "availableBalance": "inf" }),
+            serde_json::json!({ "cashBalance": 10000 }),
+        ] {
+            assert!(parse_novita_balance(&body).is_err(), "{body}");
+        }
     }
 }
