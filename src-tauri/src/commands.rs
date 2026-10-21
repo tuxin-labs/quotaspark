@@ -286,6 +286,32 @@ pub fn delete_provider(
     Ok(())
 }
 
+/// 按前端给定的 id 顺序重排供应商（卡片拖拽排序）。config.json 的 providers
+/// 顺序即展示顺序；ids 里没出现的（并发新增的）保持原有相对顺序追加在尾部。
+/// 只调展示顺序，不写活动日志（拖拽不应刷屏）。
+#[tauri::command]
+pub fn reorder_providers(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    ids: Vec<String>,
+) -> Result<(), String> {
+    let shared = state.0.clone();
+    {
+        let mut st = shared.lock().unwrap();
+        let mut next: Vec<ProviderConfig> = Vec::with_capacity(st.config.providers.len());
+        for id in &ids {
+            if let Some(pos) = st.config.providers.iter().position(|p| &p.id == id) {
+                next.push(st.config.providers.remove(pos));
+            }
+        }
+        next.append(&mut st.config.providers);
+        st.config.providers = next;
+        st.config.save(&st.config_path)?;
+    }
+    notify(&app);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_schedule(
     app: AppHandle,

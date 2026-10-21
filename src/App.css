@@ -257,6 +257,43 @@ button.danger {
   align-items: flex-start;
   gap: 12px;
 }
+.card-head-left {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 拖拽排序：手柄按住才可拖整卡；拖拽中半透明，落点卡虚线框提示 */
+.drag-handle {
+  cursor: grab;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 1px 4px;
+  border-radius: 6px;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.drag-handle:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.drag-handle:active {
+  cursor: grabbing;
+}
+
+.card.dragging {
+  opacity: 0.45;
+}
+
+.card.drop-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
+}
+
 
 .card-title {
   font-size: 15px;

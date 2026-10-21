@@ -83,6 +83,7 @@ pub fn run() {
             commands::sync_from_cc,
             commands::save_provider,
             commands::delete_provider,
+            commands::reorder_providers,
             commands::set_schedule,
             commands::activate_now,
             commands::query_quota,

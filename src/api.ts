@@ -5,6 +5,8 @@ export interface QuotaTier {
   name: string;
   utilization: number;
   resets_at: string | null;
+  /** 重置时间 epoch 秒（与 resets_at 同源），前端算「剩余多久重置」用 */
+  resets_at_ts: number | null;
   amount: string | null;
 }
 
@@ -66,6 +68,7 @@ export const api = {
   saveProvider: (provider: ProviderConfig) =>
     invoke<ProviderConfig>("save_provider", { provider }),
   deleteProvider: (id: string) => invoke<void>("delete_provider", { id }),
+  reorderProviders: (ids: string[]) => invoke<void>("reorder_providers", { ids }),
   setSchedule: (id: string, enabled: boolean, times: string[]) =>
     invoke<void>("set_schedule", { id, enabled, times }),
   activateNow: (id?: string) => invoke<number>("activate_now", { id: id ?? null }),

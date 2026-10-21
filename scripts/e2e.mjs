@@ -1,6 +1,6 @@
 /**
  * 全面端到端测试：通过 CDP 附加到应用的 WebView2，模拟真实用户操作。
- * 覆盖：页面加载、主题、同步、供应商增删改查、高级配置（团队版条件字段）、
+ * 覆盖：页面加载、主题、同步、供应商增删改查、卡片拖拽排序、高级配置（团队版条件字段）、
  * 调度（模板/chips 增改删/开关）、激活失败路径、额度查询成功+失败路径、
  * 支持性标记、开机自启、自定义确认弹窗、审计日志。
  *
@@ -167,6 +167,59 @@ await step("【查改】编辑回显（勾选/组织 ID 持久化）+ 改名往�
   await page.getByLabel("名称", { exact: true }).fill(TEST_NAME);
   await page.getByRole("button", { name: "保存" }).click();
   await testCard(page).waitFor({ timeout: 5000 });
+});
+
+await step("【排序】拖拽手柄把测试卡移到相邻卡位置，刷新后顺序保持", async () => {
+  const names = () =>
+    page.evaluate(() => [...document.querySelectorAll('[data-testid="provider-card"]')].map(el => el.dataset.name));
+  const before = await names();
+  if (before.length < 2) throw new Error("卡片少于 2 张，无法测试排序");
+  const srcIdx = before.indexOf(TEST_NAME);
+  if (srcIdx < 0) throw new Error("找不到测试卡");
+  // 落点取相邻卡：测试卡插到落点卡当前位置（落点卡顺延）
+  const target = srcIdx > 0 ? before[srcIdx - 1] : before[1];
+  const expectOrder = () => {
+    const want = [...before];
+    want.splice(srcIdx, 1);
+    const tIdx = before.indexOf(target);
+    want.splice(tIdx < srcIdx ? tIdx : tIdx - 1, 0, TEST_NAME);
+    return want;
+  };
+  // HTML5 DnD 无法用鼠标事件模拟，走页面内派发 DragEvent（React 在根节点监听，能收到）。
+  // 拖拽源是手柄自身：dragstart / dragend 都派发到手柄上，与真实拖拽的事件路径一致
+  await page.evaluate(({ srcName, dstName }) => {
+    const byName = n => document.querySelector(`[data-testid="provider-card"][data-name="${n}"]`);
+    const fire = (el, type, dt) =>
+      el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }));
+    return (async () => {
+      const d = byName(dstName);
+      const handle = byName(srcName).querySelector('[data-testid="drag-handle"]');
+      const dt = new DataTransfer();
+      fire(handle, "dragstart", dt);
+      // dragstart 里 setDragId 是异步刷的，等一帧再落点，模拟真实拖拽节奏
+      await new Promise(r => setTimeout(r, 120));
+      fire(d, "dragover", dt);
+      await new Promise(r => setTimeout(r, 60));
+      fire(d, "drop", dt);
+      fire(handle, "dragend", dt);
+    })();
+  }, { srcName: TEST_NAME, dstName: target });
+  const want = expectOrder();
+  await pollUntil(
+    async () => {
+      const after = await names();
+      return { ok: JSON.stringify(after) === JSON.stringify(want), value: after };
+    },
+    `拖拽后顺序不符，期望 ${JSON.stringify(want)}`,
+    5000,
+  );
+  // 刷新验证持久化（config.json 的 providers 顺序）
+  await page.reload();
+  await page.locator('[data-testid="provider-card"]').first().waitFor({ timeout: 8000 });
+  const persisted = await names();
+  if (JSON.stringify(persisted) !== JSON.stringify(want))
+    throw new Error(`刷新后顺序未保持，期望 ${JSON.stringify(want)}，实际 ${JSON.stringify(persisted)}`);
+  await page.screenshot({ path: `${SHOT_DIR}/10-reorder.png` });
 });
 
 /* ── 3. 调度 ─────────────────────────────────────────────── */

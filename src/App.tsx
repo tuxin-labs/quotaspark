@@ -9,10 +9,39 @@ function fmtTime(ts: number) {
   return new Date(ts).toLocaleTimeString("zh-CN", { hour12: false });
 }
 
+/** 档位带重置时间时每 30s 重渲染一次，让「剩余多久重置」保持新鲜 */
+function useMinuteTicker(active: boolean) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const id = window.setInterval(() => setTick((n) => n + 1), 30_000);
+    return () => window.clearInterval(id);
+  }, [active]);
+}
+
+// 剩余时长展示：3天2小时 / 3小时12分 / 12分钟 / 不到1分钟；已过返回 null
+function fmtRemaining(sec: number): string | null {
+  if (!(sec > 0)) return null;
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return `${d}天${h}小时`;
+  if (h > 0) return `${h}小时${m}分`;
+  if (m > 0) return `${m}分钟`;
+  return "不到1分钟";
+}
+
 function TierBar({ tier }: { tier: QuotaTier }) {
+  useMinuteTicker(tier.resets_at_ts != null);
   const pct = Math.min(100, Math.max(0, tier.utilization));
   const hot = pct >= 90;
-  const sub = [tier.resets_at ? `${tier.resets_at} 重置` : "", tier.amount ?? ""]
+  const remaining =
+    tier.resets_at_ts != null ? fmtRemaining(tier.resets_at_ts - Date.now() / 1000) : null;
+  const sub = [
+    tier.resets_at ? `${tier.resets_at} 重置` : "",
+    remaining ? `剩余${remaining}` : "",
+    tier.amount ?? "",
+  ]
     .filter(Boolean)
     .join(" · ");
   return (
@@ -298,6 +327,11 @@ export default function App() {
   const [autostart, setAutostart] = useState(false);
   const [querying, setQuerying] = useState<Record<string, boolean>>({});
   const [refreshingAll, setRefreshingAll] = useState(false);
+  // 卡片拖拽排序：拖拽源是手柄自身（常驻 draggable；整卡 draggable 会废掉卡内
+  // 文本选择，而"按下后才翻转属性"在 WebView2 原生拖拽里来不及——按下瞬间就做
+  // 命中判定）。dragId=拖拽中的卡，overId=当前悬停的落点卡。
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [overId, setOverId] = useState<string | null>(null);
   const [themeMode, cycleTheme] = useThemeCycle();
   const themeLabel = themeMode === "auto" ? "跟随系统" : themeMode === "dark" ? "深色" : "浅色";
 
@@ -357,6 +391,25 @@ export default function App() {
     } finally {
       setQuerying((m) => Object.fromEntries(Object.entries(m).filter(([k]) => !ids.includes(k))));
       setRefreshingAll(false);
+      refresh();
+    }
+  };
+
+  // 拖拽落点：把被拖卡插到落点卡的位置（落点卡顺延）。先乐观更新再持久化，
+  // 后端存完会 emit state-changed 走 refresh 兜底。
+  const commitOrder = async (sourceId: string, targetId: string) => {
+    if (sourceId === targetId) return;
+    const src = providers.find((p) => p.id === sourceId);
+    if (!src) return;
+    const next = providers.filter((p) => p.id !== sourceId);
+    const at = next.findIndex((p) => p.id === targetId);
+    if (at < 0) return;
+    next.splice(at, 0, src);
+    setProviders(next);
+    try {
+      await api.reorderProviders(next.map((p) => p.id));
+    } catch (e) {
+      console.error(e);
       refresh();
     }
   };
@@ -446,17 +499,61 @@ export default function App() {
 
       <div className="cards">
         {providers.map((p) => (
-          <div className="card" key={p.id} data-testid="provider-card" data-name={p.name}>
+          <div
+            className={
+              "card" +
+              (dragId === p.id ? " dragging" : "") +
+              (dragId && dragId !== p.id && overId === p.id ? " drop-target" : "")
+            }
+            key={p.id}
+            data-testid="provider-card"
+            data-name={p.name}
+            onDragOver={(e) => {
+              if (!dragId || dragId === p.id) return;
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
+              if (overId !== p.id) setOverId(p.id);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              // 优先用 state；兜底读 dataTransfer（dragstart 已 setData），
+              // 避免 dragstart→drop 间状态未刷出时丢落点
+              const src = dragId || e.dataTransfer.getData("text/plain");
+              if (src && src !== p.id) commitOrder(src, p.id);
+            }}
+          >
             <div className="card-head">
-              <div className="card-title-wrap">
-                <div className="card-title">
-                  {p.name}
-                  {p.cc_provider_id && <span className="badge cc">cc</span>}
-                  <span className="badge format">{p.format === "openai" ? "OpenAI" : "Anthropic"}</span>
-                  {p.enabled && <span className="badge on">定时中</span>}
-                </div>
-                <div className="card-sub">
-                  {p.model} · {p.base_url}
+              <div className="card-head-left">
+                <span
+                  className="drag-handle"
+                  data-testid="drag-handle"
+                  title="拖动调整卡片顺序"
+                  draggable
+                  onDragStart={(e) => {
+                    setDragId(p.id);
+                    e.dataTransfer.effectAllowed = "move";
+                    e.dataTransfer.setData("text/plain", p.id);
+                    // 拖拽影象显示整张卡片（默认只有小小的手柄图形）
+                    const card = (e.currentTarget as Element).closest(".card");
+                    if (card instanceof HTMLElement) e.dataTransfer.setDragImage(card, 24, 16);
+                  }}
+                  onDragEnd={() => {
+                    setDragId(null);
+                    setOverId(null);
+                  }}
+                >
+                  ⠿
+                </span>
+                <div className="card-title-wrap">
+                  <div className="card-title">
+                    {p.name}
+                    {p.cc_provider_id && <span className="badge cc">cc</span>}
+                    <span className="badge format">{p.format === "openai" ? "OpenAI" : "Anthropic"}</span>
+                    {p.enabled && <span className="badge on">定时中</span>}
+                  </div>
+                  <div className="card-sub">
+                    {p.model} · {p.base_url}
+                  </div>
                 </div>
               </div>
             </div>
